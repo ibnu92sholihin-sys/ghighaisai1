@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <title>Memverifikasi Sesi...</title>
+  <script>
+    (function() {
+      try {
+        var params = new URLSearchParams(window.location.search);
+        var dest = params.get('return_url');
+        if (dest && dest.startsWith('http')) {
+          window.location.replace(dest);
+        } else if (dest && dest.startsWith('/')) {
+          window.location.replace(dest);
+        } else {
+          window.location.replace('/');
+        }
+      } catch (e) {
+        window.location.replace('/');
+      }
+    })();
+  </script>
+</head>
+<body style="background:#0b1329;color:#94a3b8;font-family:system-ui,-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+  <p>Memuat aplikasi GHIGHAIS AI...</p>
+</body>
+</html>
