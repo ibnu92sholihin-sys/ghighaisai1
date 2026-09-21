@@ -1,0 +1,6 @@
+{
+  "name": "GHIGHAIS AI",
+  "description": "Generator Aplikasi dari Prompt: tulis prompt, dapatkan kode tanpa error, edit preview langsung, push ke GitHub, dan simpan ke ZIP.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
