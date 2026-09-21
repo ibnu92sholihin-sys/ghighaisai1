@@ -197,58 +197,302 @@ export const Route = createFileRoute("/api/github")({
           }
 
           if (body.action === "import") {
-            const url = (body.url ?? "").trim();
-            const match = url.match(/github\.com\/([^/\s]+)\/([^/\s#?]+)/i);
-            if (!match) return json({ error: "URL GitHub tidak valid" }, 400);
-            const repo = `${match[1]}/${String(match[2]).replace(/\.git$/, "")}`;
-            const headers = body.token
-              ? gh(body.token)
-              : { Accept: "application/vnd.github+json", "User-Agent": "ghighais-ai" };
+            const rawUrl = (body.url ?? "").trim();
+            if (!rawUrl) return json({ error: "URL GitHub tidak boleh kosong" }, 400);
 
-            const repoRes = await fetch(`${GH}/repos/${repo}`, { headers });
-            if (!repoRes.ok) return json({ error: "Repository tidak ditemukan" }, repoRes.status);
-            const repoData = (await repoRes.json()) as { default_branch: string };
-
-            const treeRes = await fetch(
-              `${GH}/repos/${repo}/git/trees/${repoData.default_branch}?recursive=1`,
-              { headers },
-            );
-            if (!treeRes.ok) return json({ error: "Gagal membaca isi repository" }, treeRes.status);
-            const tree = (await treeRes.json()) as {
-              tree: Array<{ path: string; type: string; size?: number }>;
-            };
-            const files = tree.tree
-              .filter((t) => t.type === "blob")
-              .map((t) => t.path)
-              .slice(0, 400);
-
-            const preferred =
-              files.find((f) => f.toLowerCase() === "index.html") ??
-              files.find((f) => f.toLowerCase().endsWith(".html")) ??
-              files.find((f) => /\.(tsx|jsx|ts|js|md)$/i.test(f));
-
-            async function readFile(path: string) {
-              const fileRes = await fetch(
-                `${GH}/repos/${repo}/contents/${encodeURIComponent(path)}?ref=${repoData.default_branch}`,
-                { headers },
+            // Parser URL GitHub lengkap (mendukung link repo, tree, blob, raw, maupun shorthand owner/repo)
+            function parseGitHubRepoUrl(input: string) {
+              const trimmed = input.trim();
+              const rawMatch = trimmed.match(
+                /raw\.githubusercontent\.com\/([^/\s]+)\/([^/\s]+)\/([^/\s]+)\/(.+)/i,
               );
-              if (!fileRes.ok) return "";
-              const data = (await fileRes.json()) as { content?: string };
-              return data.content ? fromBase64(data.content) : "";
+              if (rawMatch) {
+                return {
+                  owner: rawMatch[1],
+                  repo: rawMatch[2].replace(/\.git$/, ""),
+                  branch: rawMatch[3],
+                  filePath: decodeURIComponent(rawMatch[4]),
+                };
+              }
+
+              const blobTreeMatch = trimmed.match(
+                /(?:https?:\/\/)?(?:www\.)?github\.com\/([^/\s]+)\/([^/\s#?]+)\/(?:blob|tree)\/([^/\s#?]+)(?:\/(.+))?/i,
+              );
+              if (blobTreeMatch) {
+                return {
+                  owner: blobTreeMatch[1],
+                  repo: blobTreeMatch[2].replace(/\.git$/, ""),
+                  branch: blobTreeMatch[3],
+                  filePath: blobTreeMatch[4] ? decodeURIComponent(blobTreeMatch[4]) : undefined,
+                };
+              }
+
+              const standardMatch = trimmed.match(
+                /(?:https?:\/\/)?(?:www\.)?github\.com\/([^/\s]+)\/([^/\s#?]+)/i,
+              );
+              if (standardMatch) {
+                return {
+                  owner: standardMatch[1],
+                  repo: standardMatch[2].replace(/\.git$/, ""),
+                  branch: undefined,
+                  filePath: undefined,
+                };
+              }
+
+              const shortMatch = trimmed.match(/^([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)$/);
+              if (shortMatch) {
+                return {
+                  owner: shortMatch[1],
+                  repo: shortMatch[2].replace(/\.git$/, ""),
+                  branch: undefined,
+                  filePath: undefined,
+                };
+              }
+
+              return null;
             }
 
-            const content = preferred ? await readFile(preferred) : "";
+            const parsed = parseGitHubRepoUrl(rawUrl);
+            if (!parsed) {
+              return json(
+                {
+                  error:
+                    "Format URL GitHub tidak dikenali. Masukkan contoh: https://github.com/owner/repo atau link file repository.",
+                },
+                400,
+              );
+            }
 
-            // Collect a few more source files so the AI can rebuild the app
-            // faithfully when the repo is not a single static HTML page.
-            const extra = files
-              .filter((f) => f !== preferred)
-              .filter((f) => /\.(html|css|js|jsx|ts|tsx|json|md)$/i.test(f))
+            const repoFull = `${parsed.owner}/${parsed.repo}`;
+            const token =
+              body.token ||
+              process.env["GITHUB_TOKEN"] ||
+              process.env["GH_TOKEN"] ||
+              process.env["VITE_GITHUB_TOKEN"] ||
+              "";
+            const headers = token
+              ? gh(token)
+              : { Accept: "application/vnd.github+json", "User-Agent": "ghighais-ai" };
+
+            const repoRes = await fetch(`${GH}/repos/${repoFull}`, { headers });
+            if (!repoRes.ok) {
+              if (repoRes.status === 404) {
+                return json(
+                  {
+                    error: `Repository '${repoFull}' tidak ditemukan atau bersifat privat. Masukkan Personal Access Token (PAT) Anda di Menu jika ini repo privat.`,
+                  },
+                  404,
+                );
+              }
+              if (repoRes.status === 403 || repoRes.status === 429) {
+                return json(
+                  {
+                    error:
+                      "Batas laju request publik GitHub tercapai. Masukkan Personal Access Token (PAT) GitHub di Menu untuk akses instan tanpa batas.",
+                  },
+                  403,
+                );
+              }
+              return json({ error: "Gagal membuka data repository GitHub" }, repoRes.status);
+            }
+
+            const repoData = (await repoRes.json()) as { default_branch: string };
+            const activeBranch = parsed.branch || repoData.default_branch || "main";
+
+            // Ambil pohon file repository
+            const treeRes = await fetch(
+              `${GH}/repos/${repoFull}/git/trees/${activeBranch}?recursive=1`,
+              { headers },
+            );
+            let files: string[] = [];
+            if (treeRes.ok) {
+              const tree = (await treeRes.json()) as {
+                tree: Array<{ path: string; type: string; size?: number }>;
+              };
+              files = tree.tree
+                .filter((t) => t.type === "blob")
+                .map((t) => t.path)
+                .slice(0, 500);
+            }
+
+            async function readFile(path: string) {
+              try {
+                const fileRes = await fetch(
+                  `${GH}/repos/${repoFull}/contents/${encodeURIComponent(path)}?ref=${activeBranch}`,
+                  { headers },
+                );
+                if (fileRes.ok) {
+                  const data = (await fileRes.json()) as { content?: string };
+                  if (data.content) return fromBase64(data.content);
+                }
+                const rawRes = await fetch(
+                  `https://raw.githubusercontent.com/${repoFull}/${activeBranch}/${path}`,
+                );
+                if (rawRes.ok) return await rawRes.text();
+              } catch {
+                // ignore
+              }
+              return "";
+            }
+
+            // Tentukan entry point
+            let preferred: string | undefined = parsed.filePath;
+            if (preferred && !files.includes(preferred)) {
+              preferred =
+                files.find((f) => f.toLowerCase() === preferred?.toLowerCase()) ||
+                files.find((f) => f.toLowerCase().endsWith(preferred?.toLowerCase() ?? ""));
+            }
+
+            if (!preferred) {
+              preferred =
+                files.find((f) => f.toLowerCase() === "index.html") ??
+                files.find((f) => f.toLowerCase() === "public/index.html") ??
+                files.find((f) => f.toLowerCase().endsWith("index.html")) ??
+                files.find((f) => f.toLowerCase().endsWith(".html")) ??
+                files.find((f) =>
+                  /^(src\/)?(App|main|index)\.(tsx|jsx|vue|svelte|ts|js)$/i.test(f),
+                ) ??
+                files.find((f) => /\.(tsx|jsx|vue|svelte|ts|js|md)$/i.test(f));
+            }
+
+            let content = preferred ? await readFile(preferred) : "";
+
+            // Deteksi framework dari package.json
+            let framework = "Web";
+            let packageJsonContent = "";
+            if (files.includes("package.json")) {
+              packageJsonContent = await readFile("package.json");
+              if (packageJsonContent) {
+                try {
+                  const pkg = JSON.parse(packageJsonContent) as {
+                    dependencies?: Record<string, string>;
+                    devDependencies?: Record<string, string>;
+                  };
+                  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+                  if (deps["next"]) framework = "Next.js";
+                  else if (deps["@remix-run/react"]) framework = "Remix";
+                  else if (deps["vue"]) framework = "Vue";
+                  else if (deps["svelte"]) framework = "Svelte";
+                  else if (deps["react"]) framework = "React";
+                  else if (deps["astro"]) framework = "Astro";
+                  else if (deps["vite"]) framework = "Vite";
+                } catch {
+                  // ignore
+                }
+              }
+            }
+
+            // Periksa apakah dokumen HTML bisa langsung ditampilkan tanpa error 404
+            let canPreviewDirectly = false;
+            if (
+              preferred &&
+              preferred.toLowerCase().endsWith(".html") &&
+              content.toLowerCase().includes("</html>")
+            ) {
+              const hasLocalModuleScript =
+                /<script\s+[^>]*src=["'](\/src\/|\.\/src\/|\.\/main|\/main|\.\/app)[^"']*\.(tsx?|jsx?)/i.test(
+                  content,
+                );
+              const isEmptyRootOnly =
+                /<div\s+id=["'](root|app)["']\s*>\s*<\/div>/i.test(content) &&
+                !content.includes("<script>") &&
+                !content.includes('<script type="text/javascript">');
+
+              if (!hasLocalModuleScript && !isEmptyRootOnly) {
+                // Inlining file CSS lokal agar tampilan langsung beres (menangani urutan rel/href mana pun dan huruf besar/kecil)
+                const linkMatches = [...content.matchAll(/<link\b([^>]*?)>/gi)];
+                for (const match of linkMatches) {
+                  const tagAttrs = match[1];
+                  const isStylesheet =
+                    /rel=["']?stylesheet["']?/i.test(tagAttrs) ||
+                    /type=["']?text\/css["']?/i.test(tagAttrs);
+                  const hrefMatch = tagAttrs.match(/href=["']?([^"'\s>]+)["']?/i);
+                  if (isStylesheet && hrefMatch) {
+                    const href = hrefMatch[1];
+                    if (
+                      !href.startsWith("http") &&
+                      !href.startsWith("//") &&
+                      !href.startsWith("data:")
+                    ) {
+                      const cleanHref = href.replace(/^\.?\//, "");
+                      const matchedCssFile = files.find(
+                        (f) =>
+                          f.toLowerCase() === cleanHref.toLowerCase() ||
+                          f.toLowerCase().endsWith(cleanHref.toLowerCase()) ||
+                          f.toLowerCase().endsWith("/" + cleanHref.toLowerCase()),
+                      );
+                      if (matchedCssFile) {
+                        const cssCode = await readFile(matchedCssFile);
+                        if (cssCode) {
+                          content = content.replace(
+                            match[0],
+                            `<style>/* Inlined: ${cleanHref} */\n${cssCode}</style>`,
+                          );
+                        }
+                      }
+                    }
+                  }
+                }
+
+                // Inlining file JS lokal vanilla
+                const scriptMatches = [
+                  ...content.matchAll(
+                    /<script\b([^>]*?)src=["']?([^"'\s>]+)["']?([^>]*?)>\s*<\/script>/gi,
+                  ),
+                ];
+                for (const match of scriptMatches) {
+                  const src = match[2];
+                  if (
+                    !src.startsWith("http") &&
+                    !src.startsWith("//") &&
+                    !src.startsWith("data:") &&
+                    !src.endsWith(".tsx") &&
+                    !src.endsWith(".ts") &&
+                    !src.endsWith(".jsx")
+                  ) {
+                    const cleanSrc = src.replace(/^\.?\//, "");
+                    const matchedJsFile = files.find(
+                      (f) =>
+                        f.toLowerCase() === cleanSrc.toLowerCase() ||
+                        f.toLowerCase().endsWith(cleanSrc.toLowerCase()) ||
+                        f.toLowerCase().endsWith("/" + cleanSrc.toLowerCase()),
+                    );
+                    if (matchedJsFile) {
+                      const jsCode = await readFile(matchedJsFile);
+                      if (jsCode) {
+                        content = content.replace(
+                          match[0],
+                          `<script>/* Inlined: ${cleanSrc} */\n${jsCode}</script>`,
+                        );
+                      }
+                    }
+                  }
+                }
+
+                // Ubah gambar relatif ke raw github
+                content = content.replace(
+                  /<img\s+([^>]*?)src=["'](\.\/|(?!\/|http:\/\/|https:\/\/|data:))([^"']+)["']/gi,
+                  (_m, attrs, _pfx, srcPath) => {
+                    return `<img ${attrs}src="https://raw.githubusercontent.com/${repoFull}/${activeBranch}/${srcPath}"`;
+                  },
+                );
+
+                canPreviewDirectly = true;
+              }
+            }
+
+            // Kumpulkan berkas-berkas penting untuk kompilasi AI
+            const keyComponents = files
+              .filter((f) => f !== preferred && f !== "package.json")
+              .filter(
+                (f) =>
+                  /^(src\/|components\/|pages\/|app\/|lib\/)/i.test(f) ||
+                  /\.(tsx|jsx|vue|svelte|css|json|html)$/i.test(f) ||
+                  /README\.md$/i.test(f),
+              )
               .filter((f) => !/node_modules|package-lock|bun\.lock|\.min\./i.test(f))
-              .slice(0, 8);
+              .slice(0, 15);
 
-            // Mode "deep" dipakai untuk migrasi database: ambil semua berkas yang
-            // menyimpan skema, migrasi, model, query dan konfigurasi database.
             const dbPattern =
               /(\.sql$|schema|migration|migrations|prisma|drizzle|knex|sequelize|typeorm|models?\/|entities?\/|seed|database|\bdb\b|supabase|turso|neon|mongo|firebase|\.env\.example$)/i;
             const dbFiles = body.deep
@@ -258,10 +502,17 @@ export const Route = createFileRoute("/api/github")({
                   .slice(0, 80)
               : [];
 
-            const limit = body.deep ? 400000 : 60000;
-            let sources = preferred ? `--- FILE: ${preferred} ---\n${content}\n` : "";
-            const seen = new Set<string>([preferred ?? ""]);
-            for (const path of [...dbFiles, ...extra]) {
+            const limit = body.deep ? 400000 : 80000;
+            let sources = "";
+            if (packageJsonContent) {
+              sources += `--- FILE: package.json ---\n${packageJsonContent}\n`;
+            }
+            if (preferred && content) {
+              sources += `--- FILE: ${preferred} ---\n${content}\n`;
+            }
+
+            const seen = new Set<string>([preferred ?? "", "package.json"]);
+            for (const path of [...dbFiles, ...keyComponents]) {
               if (sources.length > limit) break;
               if (seen.has(path)) continue;
               seen.add(path);
@@ -270,11 +521,15 @@ export const Route = createFileRoute("/api/github")({
             }
 
             return json({
-              repo,
-              branch: repoData.default_branch,
+              ok: true,
+              repo: repoFull,
+              branch: activeBranch,
               files,
               entry: preferred,
               content,
+              canPreviewDirectly,
+              needsCompilation: !canPreviewDirectly,
+              framework,
               sources,
             });
           }

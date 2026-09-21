@@ -75,16 +75,37 @@ type GatewayInput =
     }>;
 
 function friendlyError(status: number, raw: string) {
-  if (status === 402) {
-    return "Kuota AI pada workspace habis. Tambahkan kredit untuk melanjutkan.";
+  let message = (raw || "").trim();
+  try {
+    const parsed = JSON.parse(raw) as { error?: { message?: string; status?: string } };
+    if (parsed.error?.message) {
+      message = parsed.error.message;
+    }
+  } catch {
+    /* raw text */
   }
-  if (status === 429) {
-    return "Permintaan terlalu cepat atau rate-limit. Sedang mencoba ulang otomatis...";
+
+  if (status === 402 || message.toLowerCase().includes("quota")) {
+    return "Kuota AI pada workspace tercapai. Masukkan API Key cadangan di Menu atau klik 'Pulihkan Jalur AI'.";
   }
-  if (status === 401 || status === 403) {
-    return "Kunci API AI belum diizinkan atau tidak valid.";
+  if (
+    status === 429 ||
+    message.toLowerCase().includes("resource_exhausted") ||
+    message.toLowerCase().includes("rate")
+  ) {
+    return "Permintaan terlalu padat (rate limit). Sistem sedang mencoba jalur alternatif, silakan coba sesaat lagi.";
   }
-  return raw || "Layanan AI sedang bermasalah, silakan coba lagi.";
+  if (status === 401 || status === 403 || message.toLowerCase().includes("api key")) {
+    return "Kunci API Gemini belum diizinkan atau tidak valid. Silakan periksa kunci di Menu.";
+  }
+  if (
+    status === 404 ||
+    message.toLowerCase().includes("is no longer available") ||
+    message.toLowerCase().includes("not_found")
+  ) {
+    return "Jalur model AI sedang dialihkan ke versi stabil terbaru (Gemini 3.5 Flash). Silakan tekan tombol Generate kembali.";
+  }
+  return message || "Layanan AI sedang sibuk, silakan coba sesaat lagi.";
 }
 
 // Auto-repair unclosed tags to guarantee zero document syntax errors
@@ -125,15 +146,11 @@ export const Route = createFileRoute("/api/generate")({
             hasGemini: !!geminiKey,
             hasLovable: !!lovableKey,
             availableModels: [
-              "gemini-2.5-flash",
-              "gemini-2.5-flash-lite",
-              "gemini-1.5-flash",
-              "gemini-2.0-flash",
-              "gemini-2.0-flash-lite",
-              "gemini-flash-latest",
+              "gemini-3.5-flash",
               "gemini-3.8-flash",
-              "gemini-3.7-flash",
-              "gemini-3.6-flash",
+              "gemini-flash-latest",
+              "gemini-3.5-flash-lite",
+              "gemini-2.5-flash",
             ],
             timestamp: Date.now(),
           }),
@@ -312,7 +329,7 @@ export const Route = createFileRoute("/api/generate")({
 
             async function callGeminiStream(
               currentContents: typeof contents,
-              modelName = "gemini-2.5-flash",
+              modelName = "gemini-3.5-flash",
               allowRotate = true,
             ): Promise<Response> {
               const activeKey = getActiveKey();
@@ -392,15 +409,26 @@ export const Route = createFileRoute("/api/generate")({
               currentContents: typeof contents,
             ): Promise<{ resp: Response | null; activeModel: string }> {
               const allModels = [
+                "gemini-3.5-flash",
+                "gemini-3.8-flash",
+                "gemini-flash-latest",
+                "gemini-3.5-flash-lite",
                 "gemini-2.5-flash",
-                "gemini-2.5-flash-lite",
-                "gemini-1.5-flash",
-                "gemini-2.0-flash",
-                "gemini-2.0-flash-lite",
               ];
+              // Alihkan model usang atau invalid otomatis ke gemini-3.5-flash
+              let preferred = body.preferredModel;
+              if (
+                preferred &&
+                (preferred.includes("2.0") ||
+                  preferred.includes("1.5") ||
+                  !allModels.includes(preferred))
+              ) {
+                preferred = "gemini-3.5-flash";
+              }
+
               const candidateModels =
-                body.preferredModel && allModels.includes(body.preferredModel)
-                  ? [body.preferredModel, ...allModels.filter((m) => m !== body.preferredModel)]
+                preferred && allModels.includes(preferred)
+                  ? [preferred, ...allModels.filter((m) => m !== preferred)]
                   : allModels;
 
               let lastResp: Response | null = null;
@@ -410,7 +438,10 @@ export const Route = createFileRoute("/api/generate")({
                   if (resp.ok) {
                     return { resp, activeModel: model };
                   }
-                  lastResp = resp;
+                  // Abaikan status 404 (model usang/dihapus Google), utamakan simpan status lain (seperti 429 atau 402)
+                  if (resp.status !== 404 || !lastResp) {
+                    lastResp = resp;
+                  }
                 } catch {
                   /* try next candidate */
                 }

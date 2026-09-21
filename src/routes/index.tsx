@@ -86,13 +86,11 @@ async function secureCode(code: string) {
 }
 
 const AVAILABLE_MODELS = [
-  "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",
-  "gemini-1.5-flash",
-  "gemini-2.0-flash",
-  "gemini-2.0-flash-lite",
-  "gemini-flash-latest",
+  "gemini-3.5-flash",
   "gemini-3.8-flash",
+  "gemini-flash-latest",
+  "gemini-3.5-flash-lite",
+  "gemini-2.5-flash",
 ] as const;
 
 function Index() {
@@ -101,7 +99,7 @@ function Index() {
   const [prompt, setPrompt] = useState("");
   const [githubUrl, setGithubUrl] = useState("");
   const [code, setCode] = useState(STARTER_CODE);
-  const [activeModel, setActiveModel] = useState<string>("gemini-2.5-flash");
+  const [activeModel, setActiveModel] = useState<string>("gemini-3.5-flash");
   const [refreshingEngine, setRefreshingEngine] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -167,8 +165,16 @@ function Index() {
     const geminiSaved = localStorage.getItem("ghighais:gemini");
     if (geminiSaved) setGeminiToken(geminiSaved);
     const savedModel = localStorage.getItem("ghighais:model");
-    if (savedModel && (AVAILABLE_MODELS as readonly string[]).includes(savedModel)) {
+    if (
+      savedModel &&
+      !savedModel.includes("2.0") &&
+      !savedModel.includes("1.5") &&
+      (AVAILABLE_MODELS as readonly string[]).includes(savedModel)
+    ) {
       setActiveModel(savedModel);
+    } else {
+      setActiveModel("gemini-3.5-flash");
+      localStorage.setItem("ghighais:model", "gemini-3.5-flash");
     }
     if (Object.keys(legacy).length) {
       void vault("save", legacy)
@@ -240,26 +246,19 @@ function Index() {
     }
 
     const currentIndex = (AVAILABLE_MODELS as readonly string[]).indexOf(activeModel);
-    const nextIndex = (currentIndex + 1) % AVAILABLE_MODELS.length;
+    const nextIndex = currentIndex === -1 ? 0 : (currentIndex + 1) % AVAILABLE_MODELS.length;
     const nextModel = AVAILABLE_MODELS[nextIndex];
 
     try {
-      const res = await fetch("/api/generate");
-      if (res.ok) {
-        setActiveModel(nextModel);
-        localStorage.setItem("ghighais:model", nextModel);
-        toast.success(
-          `Jalur AI berhasil disegarkan ke: ${nextModel}! Kuota segar aktif, dan Project Anda tetap aman 100%.`,
-          {
-            duration: 4500,
-            icon: "⚡",
-          },
-        );
-      } else {
-        setActiveModel(nextModel);
-        localStorage.setItem("ghighais:model", nextModel);
-        toast.success(`Jalur dialihkan ke ${nextModel}. Project Anda aman 100%.`);
-      }
+      setActiveModel(nextModel);
+      localStorage.setItem("ghighais:model", nextModel);
+      toast.success(
+        `Jalur AI berhasil disegarkan ke: ${nextModel}! Kuota segar aktif, dan Project Anda tetap aman 100%.`,
+        {
+          duration: 4500,
+          icon: "⚡",
+        },
+      );
     } catch {
       setActiveModel(nextModel);
       localStorage.setItem("ghighais:model", nextModel);
@@ -349,7 +348,27 @@ function Index() {
       } catch (error) {
         // Jamin kode lama tidak hilang
         setCode(base);
-        const msg = (error as Error).message;
+        let msg = (error as Error).message || "Terjadi kendala pada koneksi AI";
+        try {
+          if (msg.trim().startsWith("{") && msg.includes('"error"')) {
+            const parsed = JSON.parse(msg) as { error?: { message?: string } };
+            if (parsed.error?.message) {
+              msg = parsed.error.message;
+            }
+          }
+        } catch {
+          /* raw */
+        }
+        if (
+          msg.includes("no longer available") ||
+          msg.includes("not found") ||
+          msg.includes("NOT_FOUND")
+        ) {
+          msg =
+            "Jalur AI dialihkan otomatis ke Gemini 3.5 Flash stabil. Silakan klik tombol Generate kembali.";
+          setActiveModel("gemini-3.5-flash");
+          localStorage.setItem("ghighais:model", "gemini-3.5-flash");
+        }
         toast.error(msg);
         if (
           msg.includes("limit") ||
@@ -446,14 +465,28 @@ function Index() {
     [code, generating, runGenerate],
   );
 
-  async function handleImport() {
-    if (!githubUrl.trim()) return;
+  function isLikelyGitHub(str: string) {
+    const s = str.trim();
+    return (
+      /github\.com/i.test(s) ||
+      /raw\.githubusercontent\.com/i.test(s) ||
+      /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(s)
+    );
+  }
+
+  async function handleImport(targetUrl?: string) {
+    const urlToUse = (typeof targetUrl === "string" ? targetUrl : githubUrl).trim();
+    if (!urlToUse) {
+      toast.error("Masukkan atau tempel URL GitHub terlebih dahulu");
+      return;
+    }
     setImporting(true);
+    toast.info("Menghubungkan ke GitHub & membaca berkas…");
     try {
       const res = await fetch("/api/github", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "import", url: githubUrl, token: ghToken || undefined }),
+        body: JSON.stringify({ action: "import", url: urlToUse, token: ghToken || undefined }),
       });
       const data = (await res.json()) as {
         error?: string;
@@ -462,35 +495,49 @@ function Index() {
         files?: string[];
         sources?: string;
         repo?: string;
+        canPreviewDirectly?: boolean;
+        needsCompilation?: boolean;
+        framework?: string;
       };
       if (!res.ok) throw new Error(data.error || "Gagal membuka repository");
-      const isFullPage =
-        (data.content ?? "").toLowerCase().includes("</html>") &&
-        (data.entry ?? "").toLowerCase().endsWith(".html");
-      if (isFullPage) {
-        setCode(await secureCode(data.content as string));
-        toast.success(`Repo dibuka: ${data.entry} (${data.files?.length ?? 0} file)`);
+
+      // Jika berkas HTML statis mandiri yang siap di-render di preview
+      if (data.canPreviewDirectly && data.content) {
+        setCode(await secureCode(data.content));
+        toast.success(`Aplikasi dari repo ${data.repo ?? urlToUse} berhasil dibuka di preview!`);
         setHistory((prev) =>
           [
             ...prev,
-            { role: "user" as const, text: `Buka aplikasi dari repo ${data.repo ?? githubUrl}` },
-            { role: "assistant" as const, text: "Aplikasi dari repo ditampilkan di preview." },
+            { role: "user" as const, text: `Buka aplikasi dari repo ${data.repo ?? urlToUse}` },
+            {
+              role: "assistant" as const,
+              text: `Aplikasi dari repo ${data.repo ?? urlToUse} telah dimuat langsung di preview.`,
+            },
           ].slice(-20),
         );
         return;
       }
-      if (!data.sources) {
-        toast.error("Tidak ada file yang bisa ditampilkan");
+
+      // Jika proyek berbasis framework (React/Vue/Vite/Next/dll) atau butuh kompilasi
+      if (!data.sources && !data.content) {
+        toast.error("Tidak ada berkas yang bisa ditampilkan dari repository ini");
         return;
       }
+
       setImporting(false);
-      toast.info("Menyusun aplikasi dari isi repository…");
-      const ok = await runGenerate(
-        `Build a single working HTML document that faithfully reproduces the app in this GitHub repository (${data.repo ?? githubUrl}). Keep its pages, layout, styling, texts and interactions. Convert any framework code into plain HTML/CSS/JS in one file.\n\nRepository files:\n${data.sources.slice(0, 60000)}`,
-        "",
-        { track: `Buka dan jalankan aplikasi dari repo ${data.repo ?? githubUrl}` },
+      toast.info(
+        `Mendeteksi proyek ${data.framework || "GitHub"}. AI sedang menyusun aplikasi agar siap preview…`,
       );
-      if (ok) toast.success("Aplikasi dari repo berhasil ditampilkan");
+      const ok = await runGenerate(
+        `Build a complete, single-file runnable HTML document that faithfully reproduces the app in this GitHub repository (${data.repo ?? urlToUse}). Keep its pages, layout, styling, modern typography, and all interactions. Convert any framework components (${data.framework || "React/Vite"}) into a clean, working client-side application.\n\nRepository files:\n${(data.sources || data.content || "").slice(0, 75000)}`,
+        "",
+        { track: `Buka dan susun preview dari repo ${data.repo ?? urlToUse}` },
+      );
+      if (ok) {
+        toast.success(
+          `Aplikasi ${data.framework || ""} dari repo berhasil disusun & aktif di preview!`,
+        );
+      }
     } catch (error) {
       toast.error((error as Error).message);
     } finally {
@@ -808,23 +855,38 @@ function Index() {
             </Button>
             <div className="flex flex-1 gap-2">
               <Input
-                placeholder="Tempel URL GitHub repo…"
+                placeholder="Tempel link GitHub repo/file (otomatis dibuka)…"
                 value={githubUrl}
                 onChange={(e) => setGithubUrl(e.target.value)}
-                disabled={editMode}
+                onPaste={(e) => {
+                  const pasted = e.clipboardData.getData("text").trim();
+                  if (isLikelyGitHub(pasted)) {
+                    setGithubUrl(pasted);
+                    setTimeout(() => {
+                      void handleImport(pasted);
+                    }, 100);
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void handleImport();
+                  }
+                }}
+                disabled={editMode || importing}
               />
               <Button
                 variant="secondary"
                 className="gap-2"
-                onClick={handleImport}
-                disabled={importing || editMode}
+                onClick={() => void handleImport()}
+                disabled={importing || editMode || !githubUrl.trim()}
               >
                 {importing ? (
                   <Loader2 className="size-4 animate-spin" />
                 ) : (
                   <Github className="size-4" />
                 )}
-                Buka
+                {importing ? "Membuka…" : "Buka"}
               </Button>
             </div>
           </div>
