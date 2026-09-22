@@ -24,6 +24,7 @@ import { STARTER_CODE, stripFences } from "@/lib/ghighais";
 import { isMigrationPrompt, migrationInstruction } from "@/lib/migration";
 import { extractSecrets, hasDatabase } from "@/lib/secure-scan";
 import { applyMedia, fileToAsset, mediaInstruction, type MediaAsset } from "@/lib/media";
+import { injectDatabaseSeed } from "@/lib/database-persister";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -114,10 +115,27 @@ function Index() {
   const [storageReady, setStorageReady] = useState(false);
   const [history, setHistory] = useState<Array<{ role: "user" | "assistant"; text: string }>>([]);
   const [media, setMedia] = useState<MediaAsset[]>([]);
+  const [liveDatabase, setLiveDatabase] = useState<Record<string, unknown>>(() => {
+    try {
+      const saved = localStorage.getItem("ghighais:live_database");
+      return saved ? (JSON.parse(saved) as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  });
   const fixingRef = useRef(false);
   const historyRef = useRef<Array<{ role: "user" | "assistant"; text: string }>>([]);
   const mediaRef = useRef<MediaAsset[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  function handleDatabaseChange(db: Record<string, unknown>) {
+    setLiveDatabase(db);
+    try {
+      localStorage.setItem("ghighais:live_database", JSON.stringify(db));
+    } catch {
+      // Abaikan kegagalan penulisan storage sementara
+    }
+  }
 
   useEffect(() => {
     mediaRef.current = media;
@@ -568,14 +586,22 @@ function Index() {
   async function handlePush(repo: string) {
     setPushing(true);
     try {
+      // Sematkan snapshot database yang telah di-input pengguna agar tidak hilang saat di-push
+      const codeWithDb = injectDatabaseSeed(code, liveDatabase);
       const res = await fetch("/api/github", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "push", token: ghToken, repo, content: code }),
+        body: JSON.stringify({
+          action: "push",
+          token: ghToken,
+          repo,
+          content: codeWithDb,
+          database: liveDatabase,
+        }),
       });
       const data = (await res.json()) as { error?: string; url?: string };
       if (!res.ok) throw new Error(data.error || "Gagal push");
-      toast.success(`Berhasil push ke ${repo}`);
+      toast.success(`Berhasil push ke ${repo} (Database & data user tersimpan utuh)`);
     } catch (error) {
       toast.error((error as Error).message);
     } finally {
@@ -614,8 +640,16 @@ function Index() {
 
   async function handleZip() {
     const zip = new JSZip();
-    zip.file("index.html", code);
-    zip.file("README.md", "# Dibuat dengan GHIGHAIS AI\n");
+    // Sematkan snapshot database ke index.html
+    const codeWithDb = injectDatabaseSeed(code, liveDatabase);
+    zip.file("index.html", codeWithDb);
+    zip.file(
+      "README.md",
+      "# Dibuat dengan GHIGHAIS AI\n\nAplikasi ini siap langsung dijalankan di browser atau hosting statis apa pun.\nDatabase yang telah di-input user tersimpan utuh di dalam aplikasi dan pada berkas data/database.json.\n",
+    );
+    if (Object.keys(liveDatabase).length > 0) {
+      zip.file("data/database.json", JSON.stringify(liveDatabase, null, 2));
+    }
     const blob = await zip.generateAsync({ type: "blob" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -623,7 +657,7 @@ function Index() {
     a.download = "ghighais-ai.zip";
     a.click();
     URL.revokeObjectURL(url);
-    toast.success("ZIP tersimpan");
+    toast.success("ZIP tersimpan lengkap beserta seluruh database Anda");
   }
 
   function handleReset() {
@@ -632,12 +666,14 @@ function Index() {
     setCode("");
     setHistory([]);
     setMedia([]);
+    setLiveDatabase({});
+    localStorage.removeItem("ghighais:live_database");
     localStorage.setItem("ghighais:chat", "[]");
     setEditMode(false);
     localStorage.setItem("ghighais:prompt", "");
     localStorage.setItem("ghighais:github-url", "");
     localStorage.setItem("ghighais:code", "");
-    toast.success("Halaman berhasil dikosongkan");
+    toast.success("Halaman & database berhasil dikosongkan");
   }
 
   if (!user) {
@@ -917,6 +953,8 @@ function Index() {
               toast.success("Perubahan preview diterapkan ke coding");
             }}
             onRuntimeError={handleRuntimeError}
+            database={liveDatabase}
+            onDatabaseChange={handleDatabaseChange}
           />
         </div>
       </main>

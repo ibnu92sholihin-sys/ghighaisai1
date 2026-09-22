@@ -193,6 +193,39 @@ export const Route = createFileRoute("/api/github")({
               return json({ error: friendly }, res.status);
             }
             const data = (await res.json()) as { content?: { html_url?: string } };
+
+            // Jika ada snapshot database yang di-input pengguna, simpan juga data/database.json
+            if (
+              body.database &&
+              typeof body.database === "object" &&
+              Object.keys(body.database as object).length > 0
+            ) {
+              try {
+                const dbPath = "data/database.json";
+                const dbFileUrl = `${GH}/repos/${body.repo}/contents/${dbPath}`;
+                let dbSha: string | undefined;
+                const dbExisting = await fetch(`${dbFileUrl}?ref=${branch}`, {
+                  headers: gh(body.token as string),
+                });
+                if (dbExisting.ok) {
+                  const existingData = (await dbExisting.json()) as { sha?: string };
+                  dbSha = existingData.sha;
+                }
+                await fetch(dbFileUrl, {
+                  method: "PUT",
+                  headers: { ...gh(body.token as string), "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    message: "Simpan snapshot database pengguna dari GHIGHAIS AI",
+                    content: toBase64(JSON.stringify(body.database, null, 2)),
+                    branch,
+                    ...(dbSha ? { sha: dbSha } : {}),
+                  }),
+                });
+              } catch (_) {
+                // Jangan menggagalkan push utama jika database backup gagal
+              }
+            }
+
             return json({ ok: true, url: data.content?.html_url, branch, path });
           }
 
